@@ -36,6 +36,10 @@ REPLICATION_SLOT=re_dms
 TABLE_BLACKLIST=
 # comma separated e.g. SCHEMA_BLACKLIST="public"
 SCHEMA_BLACKLIST=
+# comma separated e.g. TABLE_WHITELIST="public.table1,public.table2"
+TABLE_WHITELIST=
+# comma separated e.g. SCHEMA_WHITELIST="public"
+SCHEMA_WHITELIST=
 TARGET_SCHEMA_NAME=
 
 # optional
