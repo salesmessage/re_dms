@@ -43,6 +43,7 @@ struct Config {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum TargetsTablesColumnNamesError {
     PoolError(deadpool_postgres::PoolError),
     TokioError(tokio_postgres::Error),

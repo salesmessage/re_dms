@@ -51,6 +51,7 @@ pub struct QueryExecution {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum DatabaseWriterError {
     PoolError(deadpool_postgres::PoolError),
     TokioError(tokio_postgres::Error),
