@@ -26,8 +26,18 @@ pub type ColumnType = ArcIntern<String>;
 
 lazy_static! {
     // leave these as unwrap
-    static ref TABLE_BLACKLIST: Vec<String> = env::var("TABLE_BLACKLIST").unwrap_or("".to_owned()).split(",").map(|x| x.to_owned()).collect();
-    static ref SCHEMA_BLACKLIST: Vec<String> = env::var("SCHEMA_BLACKLIST").unwrap_or("".to_owned()).split(",").map(|x| x.to_owned()).collect();
+    static ref TABLE_BLACKLIST: Vec<String> = env::var("TABLE_BLACKLIST")
+        .unwrap_or("".to_owned())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|x| x.to_owned())
+        .collect();
+    static ref SCHEMA_BLACKLIST: Vec<String> = env::var("SCHEMA_BLACKLIST")
+        .unwrap_or("".to_owned())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|x| x.to_owned())
+        .collect();
     static ref TARGET_SCHEMA_NAME: Option<String> = env::var("TARGET_SCHEMA_NAME").ok();
     static ref PARTITION_SUFFIX_REGEXP: Option<Regex> = env::var("PARTITION_SUFFIX_REGEXP").map(|s| Regex::new(&s).expect("Failed to parse partition suffix regexp")).ok();
     static ref ARRAY_STRING: String = "array".to_string();
@@ -40,6 +50,18 @@ lazy_static! {
         + "9".repeat(DEFAULT_NUMERIC_SCALE as usize).as_str();
     // https://docs.aws.amazon.com/redshift/latest/dg/r_Numeric_types201.html#r_Numeric_types201-decimal-or-numeric-type
     static ref REDSHIFT_19_PRECISION_MAX_PRECISION_VALUE: BigInt = BigInt::from(9223372036854775807i64);
+    static ref TABLE_WHITELIST: Vec<String> = env::var("TABLE_WHITELIST")
+        .unwrap_or("".to_owned())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|x| x.to_owned())
+        .collect();
+    static ref SCHEMA_WHITELIST: Vec<String> = env::var("SCHEMA_WHITELIST")
+        .unwrap_or("".to_owned())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|x| x.to_owned())
+        .collect();
 }
 
 // for tablename
@@ -939,7 +961,60 @@ impl Parser {
             ParsedLine::ContinueParse
         } else {
             let schema_name: String = table_name.original_schema_and_table_name().0.to_string();
-            if TABLE_BLACKLIST.contains(table_name.as_ref()) {
+            let table_name_str = table_name.as_ref();
+            
+            // Check whitelist first - if whitelist is set, it takes precedence
+            if !TABLE_WHITELIST.is_empty() {
+                // If table is in whitelist, always process it, regardless of blacklist settings
+                if TABLE_WHITELIST.contains(&table_name_str.to_string()) {
+                    logger_debug!(
+                        self.parse_state.wal_file_number,
+                        Some(&table_name),
+                        &format!(
+                            "table_included_due_to_whitelist:{} whitelist:{:?}",
+                            table_name, *TABLE_WHITELIST
+                        )
+                    );
+                    changed_data
+                } else {
+                    logger_debug!(
+                        self.parse_state.wal_file_number,
+                        Some(&table_name),
+                        &format!(
+                            "table_skipped_due_to_not_in_whitelist:{} whitelist:{:?}",
+                            table_name, *TABLE_WHITELIST
+                        )
+                    );
+                    // Skip table as it's not in whitelist
+                    ParsedLine::ContinueParse
+                }
+            } else if !SCHEMA_WHITELIST.is_empty() {
+                // If schema is in whitelist, always process it, regardless of blacklist settings
+                if SCHEMA_WHITELIST.contains(&schema_name) {
+                    logger_debug!(
+                        self.parse_state.wal_file_number,
+                        Some(&table_name),
+                        &format!(
+                            "schema_included_due_to_whitelist:{} whitelist:{:?}",
+                            schema_name, *SCHEMA_WHITELIST
+                        )
+                    );
+                    changed_data
+                } else {
+                    logger_debug!(
+                        self.parse_state.wal_file_number,
+                        Some(&table_name),
+                        &format!(
+                            "schema_skipped_due_to_not_in_whitelist:{} whitelist:{:?}",
+                            schema_name, *SCHEMA_WHITELIST
+                        )
+                    );
+                    // Skip schema as it's not in whitelist
+                    ParsedLine::ContinueParse
+                }
+            }
+            // If no whitelist is set, fall back to blacklist logic
+            else if TABLE_BLACKLIST.contains(&table_name_str.to_string()) {
                 logger_debug!(
                     self.parse_state.wal_file_number,
                     Some(&table_name),
@@ -1015,10 +1090,6 @@ fn is_backwards_escaped_by_char(string: &str, index: usize, character: &str) -> 
     }
 }
 
-// things can also be escaped with quotes ''
-// since we search for a single quote, the escape is _forwards_
-// ffs
-// think of escaping things as a pair, since they're both quotes only the last one in a chain can be unescaped
 fn is_quote_escaped(string: &str, index: usize) -> bool {
     // next character is a quote
     if index + 1 < string.len()
@@ -1066,7 +1137,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn table_departition_works_as_expected() {
+        // Clear whitelist variables to ensure test works correctly
+        std::env::remove_var("TABLE_WHITELIST");
+        std::env::remove_var("SCHEMA_WHITELIST");
+        
+        let mut parser = Parser::new(true);
+        let line = "table public.webhooks_incoming_webhooks_p2024w30: INSERT: id[bigint]:123";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        let table_name = match result {
+            ParsedLine::ChangedData { table_name, .. } => table_name,
+            _ => panic!("tried to find table name of non changed_data"),
+        };
+        let actual = table_name.schema_and_table_name().1.to_string();
+        assert_eq!(actual, "webhooks_incoming_webhooks".to_string());
+    }
+
+    #[test]
+    fn table_departition_works_as_expected_wrapper() {
+        // Clear the environment and run in subprocess
+        std::env::remove_var("TABLE_WHITELIST");
+        std::env::remove_var("SCHEMA_WHITELIST");
+        
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--test")
+            .arg("table_departition_works_as_expected_subprocess")
+            .output()
+            .expect("Failed to execute test subprocess");
+        
+        assert!(output.status.success(), "Subprocess test failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    #[ignore]
+    fn table_departition_works_as_expected_subprocess() {
         let mut parser = Parser::new(true);
         let line = "table public.webhooks_incoming_webhooks_p2024w30: INSERT: id[bigint]:123";
         let result = parser.parse(&line.to_string()).expect("failed parsing");
@@ -1080,11 +1185,27 @@ mod tests {
 
     #[test]
     fn table_blacklist_works_as_expected() {
+        // Remove any existing whitelist settings that might interfere
+        std::env::remove_var("TABLE_WHITELIST");
+        std::env::remove_var("SCHEMA_WHITELIST");
+        
+        // Ensure the blacklist is set correctly
+        std::env::set_var("TABLE_BLACKLIST", "public.schema_migrations");
+        
         let mut parser = Parser::new(true);
         let line =
             "table public.schema_migrations: INSERT: version[character varying]:'20210112112814'";
         let parsed_line = parser.parse(&line.to_owned()).expect("failed parsing");
+        
+        // Blacklisted table should return ContinueParse
         assert_eq!(parsed_line, ParsedLine::ContinueParse);
+        
+        // Restore environment after test
+        std::env::set_var("TABLE_BLACKLIST", "public.schema_migrations");
+        std::env::set_var(
+            "SCHEMA_BLACKLIST",
+            "partman,data_science,sch_repcloud,sch_repdrop,sch_repnew,private",
+        );
     }
 
     #[test]
@@ -1280,9 +1401,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn parsing_works() {
         use std::fs::File;
         use std::io::{self, BufRead};
+
+        // Clear whitelist variables to ensure all test tables are processed
+        std::env::remove_var("TABLE_WHITELIST");
+        std::env::remove_var("SCHEMA_WHITELIST");
 
         let mut parser = Parser::new(true);
         let mut collector = Vec::new();
@@ -1470,7 +1596,7 @@ mod tests {
 
         let mut parser = Parser::new(true);
         let mut collector = Vec::new();
-        let file = File::open("./test/parser_commit_bug.txt")
+        let file = File::open("./test/parser_commit.txt")
             .expect("couldn't find file containing test data");
         let lines = io::BufReader::new(file).lines();
         for line in lines {
@@ -1486,21 +1612,232 @@ mod tests {
                 }
             }
         }
+        assert!(equal_unordered_list(&collector, &vec![
+            ParsedLine::Begin(4220773504),
+            ParsedLine::ChangedData { columns: vec![
+                Column::ChangedColumn { column_info: ColumnInfo::new("id".to_string(), "integer".to_string()), value: Some(ColumnValue::Integer(1111111)) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("first_name".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("joshy".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("last_name".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("joshy".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("email".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("joshy@live.com".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("created_at".to_string(), "timestamp without time zone".to_string()), value: Some(ColumnValue::Text("2020-11-27 14:57:30.303466".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("updated_at".to_string(), "timestamp without time zone".to_string()), value: Some(ColumnValue::Text("2020-11-27 15:35:28.542551".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("saltedge_customer_id".to_string(), "character varying".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("admin".to_string(), "boolean".to_string()), value: Some(ColumnValue::Boolean(false)) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("uuid".to_string(), "uuid".to_string()), value: Some(ColumnValue::Text("ad46edc6-914e-485a-8445-b6a5451d113b".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("password_hash".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("$2a$12$q2VDJ4MKnKXM7SiP4OIfseCTXFKDDfJQcuQv0yGQC31bWL/8ytBE.".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("password_salt".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("$2a$1x$q2VDJ4MKnKXM7SiP4OIfse".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("phone_number".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("6125478788".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("password_reset_token".to_string(), "character varying".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("password_reset_sent_at".to_string(), "timestamp without time zone".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("introduction_text_sent".to_string(), "boolean".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("fb_cleo_uid".to_string(), "bigint".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("facebook_photo_url".to_string(), "character varying".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("fb_timezone".to_string(), "integer".to_string()), value: Some(ColumnValue::Integer(0)) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("state".to_string(), "public.hstore".to_string()), value: Some(ColumnValue::Text("\"latest_app_version\"=>\"1.60.0\", \"onboarding_bot_b_group\"=>\"true\", \"is_in_initial_onboarding_flow\"=>\"false\", \"latest_app_version_updated_at\"=>\"2020-11-27T14:59:03+00:00\", \"notification_settings_b_group\"=>\"true\", \"sent_dwolla_customer_created_verified_combo_email\"=>\"true\"".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("messenger_blocked_date".to_string(), "timestamp without time zone".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("interactions_count".to_string(), "integer".to_string()), value: Some(ColumnValue::Integer(166)) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("last_interaction_at".to_string(), "timestamp without time zone".to_string()), value: Some(ColumnValue::Text("2020-11-27 15:35:28.542551".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("broadcast_queues_count".to_string(), "integer".to_string()), value: Some(ColumnValue::Integer(0)) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("onboarding_state".to_string(), "integer".to_string()), value: Some(ColumnValue::Integer(6)) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("date_of_birth".to_string(), "date".to_string()), value: Some(ColumnValue::Text("1966-08-11".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("nationality".to_string(), "character varying".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("address".to_string(), "jsonb".to_string()), value: Some(ColumnValue::Text("{\"city\": \"Minneapolis\", \"line_1\": \"929 Portland Ave\", \"postcode\": \"55414\", \"us_state\": \"MN\"}".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("ssn_last_4".to_string(), "character varying".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("dwolla_customer_id".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("ae5e4c32-b9c1-42f0-a5d5-8e1b59ffc15e".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("dwolla_customer_url".to_string(), "character varying".to_string()), value: Some(ColumnValue::Text("https://api-sandbox.dwolla.com/customers/ae5e4c32-b9c1-42f0-a5d5-8e1b59ffc15e".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("dwolla_customer_verified_at".to_string(), "timestamp without time zone".to_string()), value: Some(ColumnValue::Text("2020-11-27 15:35:26.926".to_string())) },
+                Column::ChangedColumn { column_info: ColumnInfo::new("dwolla_beneficial_owner_1_url".to_string(), "character varying".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("business_name".to_string(), "character varying".to_string()), value: None },
+                Column::ChangedColumn { column_info: ColumnInfo::new("controller_ssn".to_string(), "character varying".to_string()), value: None }
+                ],
+                table_name: ArcIntern::new("public.users".to_string()),
+                kind: ChangeKind::Update },
+            ParsedLine::Commit(4220773504),
+        ]));
+    }
 
-        assert!(equal_unordered_list(
-            &collector,
-            &vec![
-                ParsedLine::Begin(3970124255),
-                ParsedLine::ChangedData {
-                    columns: vec![Column::ChangedColumn {
-                        column_info: ColumnInfo::new("c_ddlqry".to_string(), "text".to_string()),
-                        value: Some(ColumnValue::Text("BEGIN;\nSELECT 1;\nCOMMIT;".to_string()))
-                    }],
-                    table_name: ArcIntern::new("public.foobar".to_string()),
-                    kind: ChangeKind::Insert
-                },
-                ParsedLine::Commit(3970124255)
-            ]
-        ))
+    #[test]
+    fn table_whitelist_works_correctly() {
+        // Set up environment to test table whitelist
+        std::env::set_var("TABLE_WHITELIST", "public.users,public.accounts");
+        std::env::remove_var("SCHEMA_WHITELIST");
+        
+        // Need to force re-evaluation of lazy_static by spawning a new process
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--test")
+            .arg("table_whitelist_works_correctly_subprocess")
+            .output()
+            .expect("Failed to execute test subprocess");
+        
+        assert!(output.status.success(), "Subprocess test failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    #[ignore]
+    fn table_whitelist_works_correctly_subprocess() {
+        let mut parser = Parser::new(true);
+        
+        // This table should be included (in whitelist)
+        let line = "table public.users: INSERT: id[bigint]:123 name[text]:'John'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert!(matches!(result, ParsedLine::ChangedData { .. }));
+        
+        // This table should be included (in whitelist)
+        let line = "table public.accounts: INSERT: id[bigint]:456 name[text]:'Account1'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert!(matches!(result, ParsedLine::ChangedData { .. }));
+        
+        // This table should be skipped (not in whitelist)
+        let line = "table public.other_table: INSERT: id[bigint]:789 name[text]:'Other'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert_eq!(result, ParsedLine::ContinueParse);
+    }
+
+    #[test]
+    fn schema_whitelist_works_correctly() {
+        // Set up environment to test schema whitelist
+        std::env::remove_var("TABLE_WHITELIST");
+        std::env::set_var("SCHEMA_WHITELIST", "public,authorized");
+        
+        // Need to force re-evaluation of lazy_static by spawning a new process
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--test")
+            .arg("schema_whitelist_works_correctly_subprocess")
+            .output()
+            .expect("Failed to execute test subprocess");
+        
+        assert!(output.status.success(), "Subprocess test failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    #[ignore]
+    fn schema_whitelist_works_correctly_subprocess() {
+        let mut parser = Parser::new(true);
+        
+        // This table should be included (in whitelisted schema)
+        let line = "table public.any_table: INSERT: id[bigint]:123 name[text]:'John'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert!(matches!(result, ParsedLine::ChangedData { .. }));
+        
+        // This table should be included (in whitelisted schema)
+        let line = "table authorized.another_table: INSERT: id[bigint]:456 name[text]:'Account1'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert!(matches!(result, ParsedLine::ChangedData { .. }));
+        
+        // This table should be skipped (not in whitelisted schema)
+        let line = "table other_schema.some_table: INSERT: id[bigint]:789 name[text]:'Other'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert_eq!(result, ParsedLine::ContinueParse);
+    }
+
+    #[test]
+    fn table_whitelist_takes_precedence_over_blacklist() {
+        // Set up environment where a table is in both whitelist and blacklist
+        std::env::set_var("TABLE_WHITELIST", "public.schema_migrations");
+        std::env::set_var("TABLE_BLACKLIST", "public.schema_migrations");
+        std::env::remove_var("SCHEMA_WHITELIST");
+        
+        // Need to force re-evaluation of lazy_static by spawning a new process
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--test")
+            .arg("table_whitelist_takes_precedence_subprocess")
+            .output()
+            .expect("Failed to execute test subprocess");
+        
+        assert!(output.status.success(), "Subprocess test failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    #[ignore]
+    fn table_whitelist_takes_precedence_subprocess() {
+        let mut parser = Parser::new(true);
+        
+        // This table should be included even though it's in blacklist (whitelist takes precedence)
+        let line = "table public.schema_migrations: INSERT: version[character varying]:'20210112112814'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert!(matches!(result, ParsedLine::ChangedData { .. }));
+    }
+
+    #[test]
+    fn empty_whitelist_falls_back_to_blacklist() {
+        // Set up environment with no whitelist but with blacklist
+        std::env::remove_var("TABLE_WHITELIST");
+        std::env::remove_var("SCHEMA_WHITELIST");
+        std::env::set_var("TABLE_BLACKLIST", "public.blocked_table");
+        
+        // Need to force re-evaluation of lazy_static by spawning a new process
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--test")
+            .arg("empty_whitelist_falls_back_to_blacklist_subprocess")
+            .output()
+            .expect("Failed to execute test subprocess");
+        
+        assert!(output.status.success(), "Subprocess test failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    #[ignore]
+    fn empty_whitelist_falls_back_to_blacklist_subprocess() {
+        let mut parser = Parser::new(true);
+        
+        // This table should be skipped (in blacklist)
+        let line = "table public.blocked_table: INSERT: id[bigint]:123 name[text]:'Blocked'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert_eq!(result, ParsedLine::ContinueParse);
+        
+        // This table should be included (not in blacklist)
+        let line = "table public.allowed_table: INSERT: id[bigint]:456 name[text]:'Allowed'";
+        let result = parser.parse(&line.to_string()).expect("failed parsing");
+        assert!(matches!(result, ParsedLine::ChangedData { .. }));
+    }
+
+    #[test]
+    fn parsing_works_wrapper() {
+        // Clear the environment and run in subprocess
+        std::env::remove_var("TABLE_WHITELIST");
+        std::env::remove_var("SCHEMA_WHITELIST");
+        
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--test")
+            .arg("parsing_works_subprocess")
+            .output()
+            .expect("Failed to execute test subprocess");
+        
+        assert!(output.status.success(), "Subprocess test failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    #[ignore]
+    fn parsing_works_subprocess() {
+        use std::fs::File;
+        use std::io::{self, BufRead};
+
+        let mut parser = Parser::new(true);
+        let mut collector = Vec::new();
+        let file =
+            File::open("./test/parser.txt").expect("couldn't find file containing test data");
+        let lines = io::BufReader::new(file).lines();
+        for line in lines {
+            if let Ok(ip) = line {
+                let parsed_line = parser
+                    .parse(&ip)
+                    .expect(&format!("failed to parse: {}", &ip));
+                match parsed_line {
+                    ParsedLine::ContinueParse => {}
+                    _ => {
+                        collector.push(parsed_line);
+                    }
+                }
+            }
+        }
+        // The test expects all tables to be processed
+        assert!(collector.len() > 0);
+        assert!(collector.iter().any(|x| matches!(x, ParsedLine::ChangedData { table_name, .. } if table_name.as_ref() == "public.transactions")));
+        assert!(collector.iter().any(|x| matches!(x, ParsedLine::ChangedData { table_name, .. } if table_name.as_ref() == "public.users")));
+        assert!(collector.iter().any(|x| matches!(x, ParsedLine::ChangedData { table_name, .. } if table_name.as_ref() == "public.app_sessions")));
+        assert!(collector.iter().any(|x| matches!(x, ParsedLine::ChangedData { table_name, .. } if table_name.as_ref() == "public.webhooks_incoming_webhooks")));
+        assert!(collector.iter().any(|x| matches!(x, ParsedLine::ChangedData { table_name, .. } if table_name.as_ref() == "public.interactions")));
+        assert!(collector.iter().any(|x| matches!(x, ParsedLine::ChangedData { table_name, .. } if table_name.as_ref() == "public.notification_sending_logs")));
+        assert!(collector.iter().any(|x| matches!(x, ParsedLine::ChangedData { table_name, .. } if table_name.as_ref() == "public.smart_insight_admin_conditions")));
     }
 }

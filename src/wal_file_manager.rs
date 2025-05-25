@@ -226,7 +226,8 @@ impl WalFile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum WalFileMode {
     Processing,
     Reprocessing(String),
